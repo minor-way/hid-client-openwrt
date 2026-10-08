@@ -20,7 +20,8 @@ detect_asset() {
 	arch="$(. /etc/openwrt_release; echo "$DISTRIB_ARCH")"
 	case "$arch" in
 		aarch64*)        echo linux-arm64-musl ;;
-		arm_cortex-a5*|arm_cortex-a7*|arm_cortex-a8*|arm_cortex-a9*|arm_cortex-a15*|arm_cortex-a17*)
+		# Go's armv6/armv7 builds need a hardware FPU; FPU-less cores (plain arm_cortex-a9, a5) get armv5
+		arm_cortex-a7*|arm_cortex-a8*|arm_cortex-a15*|arm_cortex-a17*|arm_cortex-a9_*|arm_cortex-a5_*)
 		                 echo linux-armv7-musl ;;
 		arm_arm1176*)    echo linux-armv6 ;;
 		arm_*)           echo linux-armv5 ;;

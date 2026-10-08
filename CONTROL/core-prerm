@@ -1,0 +1,4 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+[ -x /etc/init.d/hiddify ] && /etc/init.d/hiddify stop >/dev/null 2>&1
+exit 0

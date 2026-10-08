@@ -1,0 +1,13 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+# The package is arch "all" so one file per CPU family can be offered; verify we got the right one.
+if ! /usr/bin/hiddify-core version >/dev/null 2>&1; then
+	echo "hiddify-core (@FAMILY@ build) does not run on this CPU." >&2
+	echo "Remove it (opkg remove hiddify-core) and install the file for your CPU, see README." >&2
+	exit 1
+fi
+/usr/bin/hiddify-core version | head -n1
+rm -f /var/run/hiddify/version.json
+[ -x /etc/init.d/hiddify ] && /etc/init.d/hiddify restart >/dev/null 2>&1
+exit 0

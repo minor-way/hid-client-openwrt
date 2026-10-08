@@ -13,4 +13,6 @@ chmod 750 /etc/hiddify
 /etc/init.d/hiddify enable
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
 /etc/init.d/rpcd restart
+# an upgrade runs the old prerm (stop) first; bring the proxy back so Passwall2 keeps working
+[ "$(uci -q get hiddify.main.enabled)" = 1 ] && /etc/init.d/hiddify start
 exit 0
