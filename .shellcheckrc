@@ -1,0 +1,2 @@
+shell=busybox
+disable=SC1091

@@ -1,0 +1,385 @@
+#!/usr/bin/ucode
+// rpcd exec backend for luci-app-hiddify (runs per call, so slow curl calls never block rpcd).
+
+'use strict';
+
+import { stdin, readfile, popen, stat, access } from 'fs';
+import { cursor } from 'uci';
+
+const RUN = '/var/run/hiddify';
+const CLASH = 'http://127.0.0.1:16756';
+const PW2_NODE_DEFAULT = 'hiddify';
+// logread -e takes a POSIX basic regex; keep in sync with /etc/init.d/hiddify
+const LOG_FILTER = 'hiddify\\(-core\\[[0-9]*\\]\\)\\{0,1\\}:';
+
+function shq(s) {
+	return `'${replace('' + s, "'", "'\\''")}'`;
+}
+
+function urlenc(s) {
+	return join('', map(split('' + s, ''), c => {
+		if (match(c, /^[A-Za-z0-9_.~-]$/))
+			return c;
+		let out = '';
+		for (let i = 0; i < length(c); i++)
+			out += sprintf('%%%02X', ord(c, i));
+		return out;
+	}));
+}
+
+function cmd(command) {
+	let p = popen(command);
+	if (!p)
+		return null;
+	let out = p.read('all');
+	p.close();
+	return out;
+}
+
+function readjson(path) {
+	let s = readfile(path);
+	return s ? json(s) : null;
+}
+
+function cfg(uci, sect, opt, def) {
+	let v = uci.get('hiddify', sect, opt);
+	return (v == null || v === '') ? def : v;
+}
+
+function core_pid(core) {
+	let p = trim(cmd(`pidof ${shq(replace(core, /^.*\//, ''))} 2>/dev/null`) || '');
+	return p ? +split(p, ' ')[0] : null;
+}
+
+function core_version(core) {
+	let st = stat(core);
+	if (!st)
+		return null;
+	// Running a 75 MB binary on every poll is too slow; cache per mtime.
+	let cache = readjson(`${RUN}/version.json`);
+	if (cache?.mtime == st.mtime)
+		return cache.version;
+	let v = trim(cmd(`${shq(core)} version 2>/dev/null | head -n1`) || '');
+	v = replace(v, /^hiddify-core version /, '');
+	system(`mkdir -p ${RUN}`);
+	let f = popen(`cat > ${RUN}/version.json`, 'w');
+	if (f) {
+		f.write(sprintf('%J', { mtime: st.mtime, version: v }));
+		f.close();
+	}
+	return v || null;
+}
+
+function clash(method, path, body) {
+	let args = `curl -s -m 12 -X ${method} -o - -w '\n%{http_code}' `;
+	if (body != null)
+		args += `-H 'Content-Type: application/json' -d ${shq(sprintf('%J', body))} `;
+	let out = cmd(args + shq(CLASH + path) + ' 2>/dev/null');
+	if (out == null)
+		return { error: 'curl failed' };
+	// curl appends "\n<status>"; rindex() misses a match at offset 0 (empty body), so use a regex
+	let m = match(out, /\n([0-9]+)$/);
+	let code = m ? +m[1] : 0;
+	let text = m ? substr(out, 0, length(out) - length(m[0])) : out;
+	if (code < 200 || code >= 300)
+		return { error: `HTTP ${code || 'unreachable'}`, body: text };
+	return { result: length(text) ? json(text) : {} };
+}
+
+function pw2_state(uci, node) {
+	if (!access('/etc/config/passwall2'))
+		return { installed: false };
+	uci.load('passwall2');
+	let gsect = null;
+	uci.foreach('passwall2', 'global', s => { gsect ??= s['.name']; });
+	let global_node = gsect ? uci.get('passwall2', gsect, 'node') : null;
+	let shunt = global_node && uci.get('passwall2', global_node, 'protocol') == '_shunt';
+	let current = shunt ? uci.get('passwall2', global_node, 'default_node') : global_node;
+	return {
+		installed: true,
+		global_section: gsect,
+		global_node,
+		global_remarks: global_node ? uci.get('passwall2', global_node, 'remarks') : null,
+		shunt,
+		current,
+		current_remarks: current ? uci.get('passwall2', current, 'remarks') : null,
+		node_exists: uci.get('passwall2', node) == 'nodes',
+		using: current == node,
+		enabled: uci.get('passwall2', gsect, 'enabled') == '1',
+	};
+}
+
+function pw2_node_write() {
+	let uci = cursor();
+	if (!access('/etc/config/passwall2'))
+		return { error: 'Passwall2 is not installed' };
+	let node = cfg(uci, 'main', 'pw2_node', PW2_NODE_DEFAULT);
+	uci.load('passwall2');
+	uci.set('passwall2', node, 'nodes');
+	uci.set('passwall2', node, 'remarks', 'Hiddify');
+	uci.set('passwall2', node, 'type', 'Xray');
+	uci.set('passwall2', node, 'protocol', 'socks');
+	uci.set('passwall2', node, 'address', '127.0.0.1');
+	uci.set('passwall2', node, 'port', cfg(uci, 'main', 'mixed_port', '12334'));
+	uci.set('passwall2', node, 'transport', 'raw');
+	uci.commit('passwall2');
+	return { node };
+}
+
+const methods = {
+	status: {
+		call: function() {
+			let uci = cursor();
+			let core = cfg(uci, 'main', 'core_path', '/usr/bin/hiddify-core');
+			let pid = core_pid(core);
+			let rss = null;
+			if (pid) {
+				let m = match(readfile(`/proc/${pid}/status`) || '', /VmRSS:\s+(\d+)/);
+				rss = m ? +m[1] : null;
+			}
+			let sub = stat('/etc/hiddify/sub.txt');
+			return {
+				enabled: cfg(uci, 'main', 'enabled', '0') == '1',
+				running: pid != null,
+				pid,
+				rss_kb: rss,
+				core_installed: access(core, 'x') == true,
+				core_path: core,
+				core_version: core_version(core),
+				core_job: readjson(`${RUN}/core.json`),
+				sub_job: readjson(`${RUN}/sub.json`),
+				sub_cached: sub ? { size: sub.size, mtime: sub.mtime } : null,
+				mixed_port: +cfg(uci, 'main', 'mixed_port', '12334'),
+				asset: trim(cmd('/usr/share/hiddify/core_install.sh asset') || ''),
+				pw2: pw2_state(uci, cfg(uci, 'main', 'pw2_node', PW2_NODE_DEFAULT)),
+			};
+		}
+	},
+
+	install_core: {
+		args: { version: 'latest' },
+		call: function(req) {
+			let v = req.args?.version || 'latest';
+			if (!match(v, /^(latest|v?[0-9][0-9A-Za-z.\-]*)$/))
+				return { error: 'invalid version' };
+			system(`setsid /usr/share/hiddify/core_install.sh ${shq(v)} >/dev/null 2>&1 &`);
+			return { started: true };
+		}
+	},
+
+	check_core: {
+		call: function() {
+			return { latest: trim(cmd('/usr/share/hiddify/core_install.sh check 2>/dev/null') || '') || null };
+		}
+	},
+
+	update_sub: {
+		call: function() {
+			system('setsid /usr/share/hiddify/sub_update.sh >/dev/null 2>&1 &');
+			return { started: true };
+		}
+	},
+
+	test: {
+		args: { url: 'url' },
+		call: function(req) {
+			let uci = cursor();
+			let port = cfg(uci, 'main', 'mixed_port', '12334');
+			let url = req.args?.url || 'https://www.gstatic.com/generate_204';
+			let out = trim(cmd(`curl -s -o /dev/null -m 10 -w '%{http_code} %{time_total}' -x ${shq('socks5h://127.0.0.1:' + port)} ${shq(url)} 2>/dev/null`) || '');
+			let parts = split(out, ' ');
+			let code = +parts[0];
+			return {
+				ok: code >= 200 && code < 400,
+				code,
+				ms: parts[1] ? int(+parts[1] * 1000) : null,
+			};
+		}
+	},
+
+	log: {
+		args: { lines: 200 },
+		call: function(req) {
+			let uci = cursor();
+			let n = +(req.args?.lines || 200);
+			if (n < 1 || n > 5000)
+				n = 200;
+			let persist = cfg(uci, 'main', 'log_persist', '1') == '1';
+			let file = cfg(uci, 'main', 'log_file', '/etc/hiddify/log/hiddify.log');
+			let log;
+			if (persist && access(file)) {
+				log = cmd(`tail -n ${n} ${shq(file)} 2>/dev/null`) || '';
+				let have = length(split(log, '\n')) - 1;
+				if (have < n && access(file + '.1'))
+					log = (cmd(`tail -n ${n - have} ${shq(file + '.1')} 2>/dev/null`) || '') + log;
+			}
+			else {
+				log = cmd(`logread -e ${shq(LOG_FILTER)} 2>/dev/null | tail -n ${n}`) || '';
+				// logread cannot drop entries; hide everything up to the line recorded by log_clear
+				let mark = readfile(`${RUN}/log.mark`);
+				if (mark) {
+					let i = index(log, mark);
+					if (i >= 0)
+						log = substr(log, i + length(mark));
+				}
+			}
+			let st = persist ? stat(file) : null;
+			return {
+				log: replace(log, /\x1b\[[0-9;]*m/g, ''),
+				persist,
+				file: persist ? file : null,
+				size: st?.size ?? null,
+			};
+		}
+	},
+
+	log_clear: {
+		call: function() {
+			let uci = cursor();
+			if (cfg(uci, 'main', 'log_persist', '1') == '1')
+				system('/usr/share/hiddify/log_rotate.sh clear');
+			let last = cmd(`logread -e ${shq(LOG_FILTER)} 2>/dev/null | tail -n 1`) || '';
+			system(`mkdir -p ${RUN}`);
+			let f = popen(`cat > ${RUN}/log.mark`, 'w');
+			if (f) {
+				f.write(last);
+				f.close();
+			}
+			return { ok: true };
+		}
+	},
+
+	proxies: {
+		call: function() {
+			return clash('GET', '/proxies');
+		}
+	},
+
+	select: {
+		args: { group: 'group', name: 'name' },
+		call: function(req) {
+			if (!req.args?.group || !req.args?.name)
+				return { error: 'group and name required' };
+			let res = clash('PUT', '/proxies/' + urlenc(req.args.group), { name: req.args.name });
+			// remembered across restarts by select_restore.sh (a file, not UCI, so no reload is triggered)
+			if (!res.error && req.args.group == 'select') {
+				let f = popen("cat > /etc/hiddify/selected", 'w');
+				if (f) {
+					f.write(req.args.name);
+					f.close();
+				}
+			}
+			return res;
+		}
+	},
+
+	delay: {
+		args: { name: 'name', url: 'url', timeout: 5000 },
+		call: function(req) {
+			if (!req.args?.name)
+				return { error: 'name required' };
+			let uci = cursor();
+			let url = req.args.url || cfg(uci, 'main', 'test_url', 'http://cp.cloudflare.com/');
+			let timeout = +(req.args.timeout || 5000);
+			return clash('GET', `/proxies/${urlenc(req.args.name)}/delay?timeout=${timeout}&url=${urlenc(url)}`);
+		}
+	},
+
+	// Test several servers in parallel in one call; the UI sends small batches so a call
+	// stays well under rpcd's exec timeout and one slow server cannot stall the rest.
+	delay_batch: {
+		args: { names: [], url: 'url', timeout: 5000 },
+		call: function(req) {
+			let names = req.args?.names;
+			if (type(names) != 'array' || !length(names))
+				return { error: 'names required' };
+			if (length(names) > 16)
+				names = slice(names, 0, 16);
+			let uci = cursor();
+			let url = req.args.url || cfg(uci, 'main', 'test_url', 'http://cp.cloudflare.com/');
+			let timeout = +(req.args.timeout || 5000);
+			let tmp = trim(cmd('mktemp -d /tmp/hiddify-delay.XXXXXX') || '');
+			if (!tmp)
+				return { error: 'mktemp failed' };
+			let script = '';
+			for (let i, n in names)
+				script += `curl -s -m ${int(timeout / 1000) + 3} -o ${tmp}/${i} ` +
+					shq(`${CLASH}/proxies/${urlenc(n)}/delay?timeout=${timeout}&url=${urlenc(url)}`) + ' & ';
+			system(script + 'wait');
+			let result = {};
+			for (let i, n in names) {
+				let r = null;
+				try { r = json(readfile(`${tmp}/${i}`) || 'null'); } catch (e) {}
+				result[n] = r?.delay ?? 0;
+			}
+			system(`rm -rf ${tmp}`);
+			return { result };
+		}
+	},
+
+	pw2_node: {
+		call: function() {
+			return pw2_node_write();
+		}
+	},
+
+	// use=true: point Passwall2 at the hiddify node (shunt default, or the global node);
+	// use=false: restore what was there before.
+	pw2_use: {
+		args: { use: true },
+		call: function(req) {
+			let uci = cursor();
+			let node = cfg(uci, 'main', 'pw2_node', PW2_NODE_DEFAULT);
+			let st = pw2_state(uci, node);
+			if (!st.installed)
+				return { error: 'Passwall2 is not installed' };
+			if (!st.global_section || !st.global_node)
+				return { error: 'Passwall2 has no main node selected' };
+
+			let sect = st.shunt ? st.global_node : st.global_section;
+			let opt = st.shunt ? 'default_node' : 'node';
+
+			if (req.args?.use !== false) {
+				if (!st.node_exists)
+					pw2_node_write();
+				if (!st.using) {
+					uci.set('hiddify', 'main', 'pw2_prev', `${sect}:${opt}:${st.current || ''}`);
+					uci.commit('hiddify');
+				}
+				// fresh cursor: pw2_node may have just rewritten passwall2 behind our back
+				uci = cursor();
+				uci.set('passwall2', sect, opt, node);
+			}
+			else {
+				let prev = split(cfg(uci, 'main', 'pw2_prev', ''), ':');
+				if (length(prev) != 3 || !prev[2])
+					return { error: 'No previous Passwall2 node recorded' };
+				uci.set('passwall2', prev[0], prev[1], prev[2]);
+			}
+			uci.commit('passwall2');
+			system('setsid /etc/init.d/passwall2 restart >/dev/null 2>&1 &');
+			return { ok: true };
+		}
+	},
+};
+
+function arg_spec() {
+	let spec = {};
+	for (let name, m in methods)
+		spec[name] = m.args || {};
+	return spec;
+}
+
+if (ARGV[0] == 'list') {
+	print(sprintf('%J\n', arg_spec()));
+}
+else if (ARGV[0] == 'call' && methods[ARGV[1]]) {
+	let input = stdin.read('all');
+	let args = null;
+	try { args = length(input) ? json(input) : {}; } catch (e) { args = {}; }
+	let res = methods[ARGV[1]].call({ args });
+	print(sprintf('%J\n', res ?? {}));
+}
+else {
+	print('{"error":"unknown method"}\n');
+}

@@ -1,0 +1,9 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+/etc/init.d/hiddify stop
+/etc/init.d/hiddify disable
+nft delete table inet hiddify 2>/dev/null
+sed -i '/# hiddify-sub$/d; /# hiddify-log$/d' /etc/crontabs/root 2>/dev/null
+/etc/init.d/cron restart >/dev/null 2>&1
+exit 0

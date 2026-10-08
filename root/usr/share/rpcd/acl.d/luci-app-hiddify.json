@@ -1,0 +1,18 @@
+{
+	"luci-app-hiddify": {
+		"description": "Grant access to Hiddify client",
+		"read": {
+			"ubus": {
+				"luci.hiddify": [ "status", "check_core", "test", "log", "proxies", "delay", "delay_batch" ]
+			},
+			"uci": [ "hiddify", "passwall2" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.hiddify": [ "install_core", "update_sub", "log_clear", "select", "pw2_node", "pw2_use" ],
+				"rc": [ "init" ]
+			},
+			"uci": [ "hiddify" ]
+		}
+	}
+}

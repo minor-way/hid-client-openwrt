@@ -1,0 +1,10 @@
+Package: luci-app-hiddify
+Version: 1.2.1-r1
+Depends: libc, luci-base, rpcd, curl, ca-bundle, ucode, ucode-mod-uci, ucode-mod-fs, nftables
+Source: local
+SourceName: luci-app-hiddify
+License: MIT
+Section: luci
+Architecture: all
+Maintainer: minor-way
+Description: LuCI client for hiddify-core: subscription, settings, server selection and Passwall2 integration.

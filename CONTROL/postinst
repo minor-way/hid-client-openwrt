@@ -1,0 +1,16 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+. /lib/functions.sh
+
+gid="$(group_add_next hiddify)"
+user_exists hiddify || user_add hiddify "" "$gid" hiddify /etc/hiddify /bin/false
+
+mkdir -p /etc/hiddify
+chown -R hiddify:hiddify /etc/hiddify
+chmod 750 /etc/hiddify
+
+/etc/init.d/hiddify enable
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+/etc/init.d/rpcd restart
+exit 0
